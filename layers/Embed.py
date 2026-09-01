@@ -133,10 +133,11 @@ class DataEmbedding_inverted(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x, x_mark):
-        x = x.permute(0, 2, 1)
+        # 전치 (Variate 축으로 변환)
+        x = x.permute(0, 2, 1) # [B, N-1, L]  예: [32, 2, 168]
         # x: [Batch Variate Time]
         if x_mark is None:
-            x = self.value_embedding(x)
+            x = self.value_embedding(x) # [B, N-1, d_model] 예: [32, 2, 512]
         else:
             x = self.value_embedding(torch.cat([x, x_mark.permute(0, 2, 1)], 1))
         # x: [Batch Variate d_model]

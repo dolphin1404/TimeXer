@@ -5,7 +5,35 @@ import glob
 import re
 import torch
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
+try:
+    from sklearn.preprocessing import StandardScaler
+except Exception:
+    class StandardScaler:
+        """Lightweight fallback for sklearn.preprocessing.StandardScaler when sklearn is not installed."""
+        def __init__(self):
+            self.mean_ = None
+            self.scale_ = None
+
+        def fit(self, X):
+            arr = np.asarray(X, dtype=float)
+            # compute mean and std along columns
+            self.mean_ = arr.mean(axis=0)
+            self.scale_ = arr.std(axis=0)
+            # avoid division by zero
+            if np.ndim(self.scale_) == 0:
+                if self.scale_ == 0:
+                    self.scale_ = 1.0
+            else:
+                self.scale_[self.scale_ == 0] = 1.0
+            return self
+
+        def transform(self, X):
+            arr = np.asarray(X, dtype=float)
+            return (arr - self.mean_) / self.scale_
+
+        def inverse_transform(self, X):
+            arr = np.asarray(X, dtype=float)
+            return arr * self.scale_ + self.mean_
 from utils.timefeatures import time_features
 from data_provider.m4 import M4Dataset, M4Meta
 from data_provider.uea import subsample, interpolate_missing, Normalizer

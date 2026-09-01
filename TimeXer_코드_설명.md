@@ -90,6 +90,8 @@ TimeXer는 **외생 변수(exogenous variables)**를 활용한 시계열 예측�
 
 ### 1단계: 정규화 (Normalization)
 
+**📁 위치:** `models/TimeXer.py` - `forecast()` 메서드 내
+
 ```python
 # 평균 계산
 means = x_enc.mean(1, keepdim=True)  # [B, 1, N]
@@ -110,15 +112,14 @@ x_enc = x_enc / stdev  # [B, L, N]
 
 ### 2단계: 내생/외생 변수 분리
 
+**📁 위치:** `models/TimeXer.py` - `forecast()` 메서드 내
+
 #### Features = 'MS' (Multivariate → Single) 모드
 
 ```python
-# 내생 변수 (예측 타겟): 마지막 변수만 추출
-en_data = x_enc[:, :, -1].unsqueeze(-1)  # [B, L, 1]
-en_data = en_data.permute(0, 2, 1)       # [B, 1, L]
-
-# 외생 변수: 나머지 변수들
-ex_data = x_enc[:, :, :-1]  # [B, L, N-1]
+# 실제 코드 (MS 모드, forecast)
+en_embed, n_vars = self.en_embedding(x_enc[:, :, -1].unsqueeze(-1).permute(0, 2, 1))
+ex_embed = self.ex_embedding(x_enc[:, :, :-1], x_mark_enc)
 ```
 
 **텐서 차원:**
@@ -127,17 +128,19 @@ ex_data = x_enc[:, :, :-1]  # [B, L, N-1]
 
 #### Features = 'M' (Multivariate → Multivariate) 모드
 
-```python
-# 모든 변수를 내생으로 취급
-en_data = x_enc.permute(0, 2, 1)  # [B, N, L]
+**📁 위치:** `models/TimeXer.py` - `forecast_multi()` 메서드 내
 
-# 외생도 동일한 데이터 사용
-ex_data = x_enc  # [B, L, N]
+```python
+# 실제 코드 (M 모드, forecast_multi)
+en_embed, n_vars = self.en_embedding(x_enc.permute(0, 2, 1))
+ex_embed = self.ex_embedding(x_enc, x_mark_enc)
 ```
 
 ---
 
 ### 3단계: 내생 변수 임베딩 (EnEmbedding)
+
+**📁 위치:** `models/TimeXer.py` - `EnEmbedding` 클래스
 
 #### 3-1. 패치 생성 (Patching)
 
@@ -159,6 +162,8 @@ x = x.unfold(dimension=-1, size=patch_len, step=patch_len)
 
 #### 3-2. 배치 재구성
 
+**📁 위치:** `models/TimeXer.py` - `EnEmbedding.forward()`
+
 ```python
 # 변수 차원과 배치 차원 병합
 x = torch.reshape(x, (B * n_vars, num_patches, patch_len))
@@ -166,6 +171,8 @@ x = torch.reshape(x, (B * n_vars, num_patches, patch_len))
 ```
 
 #### 3-3. 임베딩
+
+**📁 위치:** `models/TimeXer.py` - `EnEmbedding.forward()`
 
 ```python
 # Linear 변환으로 임베딩
@@ -181,6 +188,8 @@ x = x + self.position_embedding(x)  # [32, 7, 512]
 - sin/cos 함수 기반 인코딩
 
 #### 3-4. 글로벌 토큰 추가
+
+**📁 위치:** `models/TimeXer.py` - `EnEmbedding.forward()`
 
 ```python
 # 원래 형태로 재구성
@@ -205,9 +214,41 @@ x = torch.reshape(x, (B * n_vars, num_patches+1, d_model))
 **최종 내생 임베딩:** `[B*n_vars, num_patches+1, d_model]`
 - 예: `[32, 8, 512]`
 
+실제 구현 코드 (원문 발췌): `models/TimeXer.py` - `EnEmbedding`
+
+```python
+class EnEmbedding(nn.Module):
+   def __init__(self, n_vars, d_model, patch_len, dropout):
+      super(EnEmbedding, self).__init__()
+      # Patching
+      self.patch_len = patch_len
+
+      self.value_embedding = nn.Linear(patch_len, d_model, bias=False)
+      self.glb_token = nn.Parameter(torch.randn(1, n_vars, 1, d_model))
+      self.position_embedding = PositionalEmbedding(d_model)
+
+      self.dropout = nn.Dropout(dropout)
+
+   def forward(self, x):
+      # do patching
+      n_vars = x.shape[1]
+      glb = self.glb_token.repeat((x.shape[0], 1, 1, 1))
+
+      x = x.unfold(dimension=-1, size=self.patch_len, step=self.patch_len)
+      x = torch.reshape(x, (x.shape[0] * x.shape[1], x.shape[2], x.shape[3]))
+      # Input encoding
+      x = self.value_embedding(x) + self.position_embedding(x)
+      x = torch.reshape(x, (-1, n_vars, x.shape[-2], x.shape[-1]))
+      x = torch.cat([x, glb], dim=2)
+      x = torch.reshape(x, (x.shape[0] * x.shape[1], x.shape[2], x.shape[3]))
+      return self.dropout(x), n_vars
+```
+
 ---
 
 ### 4단계: 외생 변수 임베딩 (DataEmbedding_inverted)
+
+**📁 위치:** `layers/Embed.py` - `DataEmbedding_inverted` 클래스 (외생 변수 임베딩)
 
 ```python
 # 입력: ex_data [B, L, N-1]
@@ -218,8 +259,29 @@ x = x.permute(0, 2, 1)  # [B, N-1, L]
 # 예: [32, 2, 168]
 
 # Linear 임베딩
+# 주의: 구현상 x_mark_enc가 있으면 [x, x_mark.permute(0,2,1)]를 채널축으로 concat한 뒤 선형 투영합니다.
 x = self.value_embedding(x)  # [B, N-1, d_model]
 # 예: [32, 2, 512]
+
+실제 구현 코드 (원문 발췌): `layers/Embed.py` - `DataEmbedding_inverted`
+
+```python
+class DataEmbedding_inverted(nn.Module):
+   def __init__(self, c_in, d_model, embed_type='fixed', freq='h', dropout=0.1):
+      super(DataEmbedding_inverted, self).__init__()
+      self.value_embedding = nn.Linear(c_in, d_model)
+      self.dropout = nn.Dropout(p=dropout)
+
+   def forward(self, x, x_mark):
+      x = x.permute(0, 2, 1)
+      # x: [Batch Variate Time]
+      if x_mark is None:
+         x = self.value_embedding(x)
+      else:
+         x = self.value_embedding(torch.cat([x, x_mark.permute(0, 2, 1)], 1))
+      # x: [Batch Variate d_model]
+      return self.dropout(x)
+```
 ```
 
 **Inverted 방식:**
@@ -234,18 +296,24 @@ x = self.value_embedding(x)  # [B, N-1, d_model]
 
 ### 5단계: 인코더 처리 (EncoderLayer)
 
+**📁 위치:** `models/TimeXer.py` - `Encoder`, `EncoderLayer` 클래스
+
 인코더는 여러 레이어로 구성되며, 각 레이어는 3개의 서브레이어를 포함합니다.
 
 #### 5-1. Self-Attention (내생 변수 내부)
+
+**📁 위치:** `models/TimeXer.py` - `EncoderLayer.forward()`
 
 ```python
 # 입력: en_embed [B*n_vars, num_patches+1, d_model]
 # 예: [32, 8, 512]
 
-# Self-Attention
-x = x + self.dropout(self.self_attention(x, x, x)[0])
-# 출력: [32, 8, 512]
-
+# Self-Attention (실제 구현)
+x = x + self.dropout(self.self_attention(
+   x, x, x,
+   attn_mask=x_mask,
+   tau=tau, delta=None
+)[0])
 x = self.norm1(x)  # Layer Normalization
 ```
 
@@ -259,24 +327,19 @@ x = self.norm1(x)  # Layer Normalization
 
 #### 5-2. Cross-Attention (외생→내생)
 
+**📁 위치:** `models/TimeXer.py` - `EncoderLayer.forward()`
+
 ```python
-# 글로벌 토큰만 추출
-x_glb_ori = x[:, -1, :].unsqueeze(1)  # [32, 1, 512]
-
-# 배치 복원
-B = ex_embed.shape[0]  # 32
-x_glb = torch.reshape(x_glb_ori, (B, -1, d_model))  # [32, 1, 512]
-
-# Cross-Attention: Query=글로벌토큰, Key,Value=외생변수
-x_glb_attn = self.cross_attention(
-    x_glb,      # Query: [32, 1, 512]
-    ex_embed,   # Key:   [32, 2, 512]
-    ex_embed    # Value: [32, 2, 512]
-)[0]
-# 출력: [32, 1, 512]
-
-# 재구성 및 잔차 연결
-x_glb_attn = torch.reshape(x_glb_attn, (B*n_vars, 1, d_model))  # [32, 1, 512]
+# 글로벌 토큰만 추출 (실제 구현)
+x_glb_ori = x[:, -1, :].unsqueeze(1)
+x_glb = torch.reshape(x_glb_ori, (B, -1, D))
+x_glb_attn = self.dropout(self.cross_attention(
+   x_glb, cross, cross,
+   attn_mask=cross_mask,
+   tau=tau, delta=delta
+)[0])
+x_glb_attn = torch.reshape(x_glb_attn,
+                     (x_glb_attn.shape[0] * x_glb_attn.shape[1], x_glb_attn.shape[2])).unsqueeze(1)
 x_glb = x_glb_ori + x_glb_attn
 x_glb = self.norm2(x_glb)
 ```
@@ -292,19 +355,18 @@ x_glb = self.norm2(x_glb)
 
 #### 5-3. 재결합 및 FFN
 
+**📁 위치:** `models/TimeXer.py` - `EncoderLayer.forward()`
+
 ```python
 # 패치들과 업데이트된 글로벌 토큰 결합
-x = torch.cat([x[:, :-1, :], x_glb], dim=1)  # [32, 8, 512]
+y = x = torch.cat([x[:, :-1, :], x_glb], dim=1)
 
-# Feed-Forward Network
+# Feed-Forward Network (1x1 Conv로 구현된 두 단계 FFN)
 y = self.dropout(self.activation(self.conv1(y.transpose(-1, 1))))
-# [32, d_ff, 8] → [32, 2048, 8]
-
 y = self.dropout(self.conv2(y).transpose(-1, 1))
-# [32, 2048, 8] → [32, 512, 8] → [32, 8, 512]
 
 # 잔차 연결 및 정규화
-output = self.norm3(x + y)  # [32, 8, 512]
+output = self.norm3(x + y)
 ```
 
 **FFN (Feed-Forward Network):**
@@ -313,6 +375,8 @@ output = self.norm3(x + y)  # [32, 8, 512]
 - 비선형성 추가 (ReLU/GELU)
 
 #### 인코더 레이어 반복
+
+**📁 위치:** `models/TimeXer.py` - `Encoder.forward()`
 
 ```python
 # 여러 레이어 반복 (e_layers=2 or 3)
@@ -324,27 +388,23 @@ for layer in self.layers:
 
 ### 6단계: 예측 헤드 (FlattenHead)
 
+**📁 위치:** `models/TimeXer.py` - `FlattenHead` 클래스
+
 ```python
-# 입력: enc_out [B*n_vars, num_patches+1, d_model]
-# 예: [32, 8, 512]
+# FlattenHead 실제 구현
+class FlattenHead(nn.Module):
+   def __init__(self, n_vars, nf, target_window, head_dropout=0):
+      super().__init__()
+      self.n_vars = n_vars
+      self.flatten = nn.Flatten(start_dim=-2)
+      self.linear = nn.Linear(nf, target_window)
+      self.dropout = nn.Dropout(head_dropout)
 
-# 재구성
-enc_out = torch.reshape(enc_out, (B, n_vars, num_patches+1, d_model))
-# 예: [32, 1, 8, 512]
-
-# 전치
-enc_out = enc_out.permute(0, 1, 3, 2)
-# 예: [32, 1, 512, 8]
-
-# Flatten: d_model × num_patches 차원으로 펼침
-x = self.flatten(enc_out)  # [32, 1, 512*8] = [32, 1, 4096]
-
-# Linear: 예측 길이로 투영
-x = self.linear(x)  # [32, 1, pred_len]
-# 예: [32, 1, 24]
-
-# 전치
-dec_out = x.permute(0, 2, 1)  # [32, 24, 1]
+   def forward(self, x):  # x: [bs x nvars x d_model x patch_num]
+      x = self.flatten(x)
+      x = self.linear(x)
+      x = self.dropout(x)
+      return x
 ```
 
 **예측 헤드 동작:**
@@ -355,6 +415,8 @@ dec_out = x.permute(0, 2, 1)  # [32, 24, 1]
 ---
 
 ### 7단계: 역정규화 (De-Normalization)
+
+**📁 위치:** `models/TimeXer.py` - `forecast()` 메서드 내
 
 ```python
 # 저장된 표준편차와 평균으로 복원
@@ -370,6 +432,8 @@ dec_out = dec_out + means[:, 0, -1:].unsqueeze(1).repeat(1, pred_len, 1)
 ## 주요 컴포넌트 상세 설명
 
 ### 1. Patching (패치화)
+
+**📁 위치:** `models/TimeXer.py` - `EnEmbedding` 클래스
 
 **원리:**
 ```
@@ -387,6 +451,8 @@ dec_out = dec_out + means[:, 0, -1:].unsqueeze(1).repeat(1, pred_len, 1)
 - Vision Transformer의 패치 개념 차용
 
 ### 2. Global Token (글로벌 토큰)
+
+**📁 위치:** `models/TimeXer.py` - `EnEmbedding.__init__()` 및 `forward()`
 
 **역할:**
 - 전체 시계열 정보의 요약
@@ -412,6 +478,8 @@ Cross-Attention:
 
 ### 3. Attention Mechanism (어텐션 메커니즘)
 
+**📁 위치:** `layers/SelfAttention_Family.py` - `FullAttention`, `AttentionLayer` 클래스
+
 **Self-Attention 수식:**
 ```
 Q = x × W_Q  (Query 생성)
@@ -435,11 +503,78 @@ Attention(Q,K,V) = softmax(QK^T / √d_k) × V
 - 다양한 관점에서 관계 학습
 - 헤드 출력을 연결(concat)하여 최종 출력
 
+실제 구현 코드 (원문 발췌): `layers/SelfAttention_Family.py` - `AttentionLayer`
+
+```python
+class AttentionLayer(nn.Module):
+   def __init__(self, attention, d_model, n_heads, d_keys=None,
+             d_values=None):
+      super(AttentionLayer, self).__init__()
+
+      d_keys = d_keys or (d_model // n_heads)
+      d_values = d_values or (d_model // n_heads)
+
+      self.inner_attention = attention
+      self.query_projection = nn.Linear(d_model, d_keys * n_heads)
+      self.key_projection = nn.Linear(d_model, d_keys * n_heads)
+      self.value_projection = nn.Linear(d_model, d_values * n_heads)
+      self.out_projection = nn.Linear(d_values * n_heads, d_model)
+      self.n_heads = n_heads
+
+   def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
+      B, L, _ = queries.shape
+      _, S, _ = keys.shape
+      H = self.n_heads
+
+      queries = self.query_projection(queries).view(B, L, H, -1)
+      keys = self.key_projection(keys).view(B, S, H, -1)
+      values = self.value_projection(values).view(B, S, H, -1)
+
+      out, attn = self.inner_attention(
+         queries,
+         keys,
+         values,
+         attn_mask,
+         tau=tau,
+         delta=delta
+      )
+      out = out.view(B, L, -1)
+
+      return self.out_projection(out), attn
+```
+
+또한, 인코더는 다음과 같이 구성됩니다 (원문 발췌): `models/TimeXer.py` - `Model.__init__`
+
+```python
+self.encoder = Encoder(
+   [
+      EncoderLayer(
+         AttentionLayer(
+            FullAttention(False, configs.factor, attention_dropout=configs.dropout,
+                       output_attention=False),
+            configs.d_model, configs.n_heads),
+         AttentionLayer(
+            FullAttention(False, configs.factor, attention_dropout=configs.dropout,
+                       output_attention=False),
+            configs.d_model, configs.n_heads),
+         configs.d_model,
+         configs.d_ff,
+         dropout=configs.dropout,
+         activation=configs.activation,
+      )
+      for l in range(configs.e_layers)
+   ],
+   norm_layer=torch.nn.LayerNorm(configs.d_model)
+)
+```
+
 ---
 
 ## 실행 순서
 
 ### 전체 Forward Pass 순서
+
+**📁 위치:** `models/TimeXer.py` - `forecast()` 메서드
 
 ```
 1. 입력 데이터 준비
@@ -575,6 +710,8 @@ Attention(Q,K,V) = softmax(QK^T / √d_k) × V
 
 ### Forward 함수 (forecast 메서드)
 
+**📁 위치:** `models/TimeXer.py` - `forecast()` 메서드
+
 ```python
 def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
     # 1. 정규화
@@ -631,3 +768,25 @@ TimeXer는 다음과 같은 독창적인 방법으로 외생 변수를 활용합
    - 효율적이고 효과적
 
 이 구조로 TimeXer는 외생 변수를 효과적으로 활용하여 정확한 시계열 예측을 수행합니다.
+
+---
+
+## 부록: 텐서 모양 시각화 스크립트 사용법
+
+문서의 텐서 흐름을 PPT에 바로 넣을 수 있도록, 텐서 모양을 단계별로 출력하고 간단한 다이어그램(PNG)으로 저장하는 스크립트를 추가했습니다.
+
+- 스크립트 경로: `scripts/shape_flow_demo.py`
+- 주요 인자: `--B --L --N --patch_len --d_model --pred_len --features`
+- 출력: 콘솔에 단계별 모양 목록, PNG 파일(`figures/shape_flow.png` 기본값)
+
+Windows PowerShell에서 실행 예시:
+
+```powershell
+python .\scripts\shape_flow_demo.py --B 32 --L 168 --N 3 --patch_len 24 --d_model 512 --pred_len 24 --features MS --png figures\shape_flow_MS.png
+python .\scripts\shape_flow_demo.py --B 16 --L 96  --N 7 --patch_len 24 --d_model 256 --pred_len 24 --features M  --png figures\shape_flow_M.png
+```
+
+참고 사항:
+- MS 모드: 내생 1개, 외생 N-1개로 분리되어 내생은 패치+글로벌, 외생은 변수 토큰으로 임베딩됩니다.
+- M 모드: 모든 변수가 내생으로 처리되어 `EnEmbedding` 입력의 `n_vars=N`가 됩니다. 외생 임베딩 또한 전체를 사용합니다.
+- `DataEmbedding_inverted`는 구현상 `x_mark_enc`가 제공되면 시간 인코딩을 `permute` 후 채널 방향으로 concat하여 선형 임베딩합니다.
